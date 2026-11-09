@@ -1,0 +1,55 @@
+name: explain-voices
+on:
+  workflow_dispatch:
+    inputs:
+      units: { description: "voice_jobs files, comma separated (e.g. sg1-u2,sg1-u3)", required: true, default: "sg1-u2" }
+jobs:
+  voice:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy: { fail-fast: false, matrix: { shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] } }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/huggingface
+          key: tts-cache-v1
+      - name: Install
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg espeak-ng
+          pip install -q torch==2.6.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cpu && pip install -q chatterbox-tts kokoro soundfile
+      - name: Generate
+        run: python tools/explain_voice.py "${{ inputs.units }}" ${{ matrix.shard }} 12
+      - uses: actions/upload-artifact@v4
+        with: { name: "part-${{ matrix.shard }}", path: out, retention-days: 7 }
+  pack:
+    needs: voice
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: parts }
+      - name: Pack one audio file per unit for the EduSpark app
+        run: |
+          mkdir -p pack && python3 - <<'PY'
+          import json, base64, os, glob
+          files = {os.path.basename(f)[:-4]: f for f in glob.glob("parts/*/*.mp3")}
+          for un in [u.strip() for u in "${{ inputs.units }}".split(",") if u.strip()]:
+              spec = json.load(open(f"voice_jobs/{un}.json", encoding="utf-8"))
+              A, E, miss = {}, {}, []
+              for j in spec["jobs"]:
+                  f = files.get(f"{un}__{j['id']}")
+                  if not f: miss.append(j["id"]); continue
+                  u = "data:audio/mpeg;base64," + base64.b64encode(open(f, "rb").read()).decode()
+                  (E.__setitem__(j["key"], u) if j.get("en") else A.__setitem__(j["id"], u))
+              A["__en"] = E
+              open(f"pack/{un}.js", "w").write("(window.EXPLAIN_AUDIO=window.EXPLAIN_AUDIO||{})[%s]=%s;" % (json.dumps(spec["unit"]), json.dumps(A)))
+              print(un, len(A) - 1, "teacher,", len(E), "english, missing:", miss)
+          PY
+      - uses: actions/upload-artifact@v4
+        with: { name: "explain-audio", path: pack, retention-days: 14 }
